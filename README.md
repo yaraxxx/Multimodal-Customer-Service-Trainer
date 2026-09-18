@@ -21,143 +21,74 @@ Architecture:
 5. Observability - Phoenix integration for tracing and monitoring AI agent behavior. Some setup is in `tracing.py`.
 6. A convenience executable that starts the 3 services: the backend (fastAPI APIs), the frontend (the gradio app) as well as 
    Arize Phoenix for tracing.
+   
+It's generative Gemini models (reasoning/thinking explicitly turned off), combined via late (decision-level) fusion across independent per-modality agents.
 
-## How to work on the project
 
-The scaffolding is provided to you. You will complete key parts of the code, applying what you have learned, following a precise sequence of steps described below.
+## Agent Roles & Architecture
 
-Every step needs to be executed in order. You can self-verify that the step has been completed successfully by executing the tests
-that we will indicate (already provided to you).
+| Role | Is it AI? | Where it lives | How it's invoked |
+|---|---|---|---|
+| Customer | Yes — Gemini via `pydantic_ai.Agent` | `agents/customer_agent.py` | `customer_agent.run(...)` inside `ChatSessionWithTracing.chat_with_gemini()` in `gradio_app.py` |
+| Trainee/agent | No — human | No agent file; it's the Gradio UI's chat input | Text/files typed/uploaded by the user in the browser |
+| Moderation agents (text/image/video/audio) | Yes — Gemini, but a different role (content reviewer, not persona) | `agents/text_agent.py`, `image_agent.py`, `video_agent.py`, `audio_agent.py` | Called via FastAPI (`fastapi_app.py`) before the human's message is allowed to reach `customer_agent` |
 
-*DO NOT* skip steps and do not proceed if the tests are not passing, as the next steps build on the previous one.
 
-# Setup
+## Requirements and Tools
+### Core dependencies
 
-Make sure you have a terminal open in the starter kit folder.
+| Library | Why it's used |
+| :---- | :---- |
+| `pydantic-ai` | Agent framework. Every agent (`text_agent`, `image_agent`, `video_agent`, `audio_agent`, `customer_agent`) is a `pydantic_ai.Agent` — it handles calling the LLM, passing multimodal input (`BinaryContent`), and forcing structured output. |
+| `google-genai` | SDK that `pydantic-ai`'s `GoogleModel`/`GoogleProvider` use to talk to the Gemini API (auth, requests/responses). |
+| `pydantic` | Defines the structured output schemas (`TextModerationResult`, `ImageModerationResult`, `VideoModerationResult`, `AudioModerationResult` in `types/moderation_result.py`), so Gemini's replies come back as validated typed objects instead of raw text to parse. |
+| `fastapi` | Backend API layer (`fastapi_app.py`) exposing `/api/v1/moderate_text`, `/moderate_image_file`, etc., with `HTTPBearer` auth. Decouples moderation logic from any specific frontend. |
+| `uvicorn[standard]` | ASGI server that runs the FastAPI app. |
+| `gradio` | Frontend chat UI (`gradio_app.py`) — the trainee's chat box, file upload widget, and the interface that calls the FastAPI backend and then the `customer_agent`. |
+| `requests` | Used by `gradio_app.py` to call the FastAPI moderation endpoints over HTTP. |
+| `filetype` | Used in `utils.py`'s `detect_file_type()` to identify uploaded files (image/video/audio) by content instead of trusting the filename extension. |
+| `python-dotenv` | Loads `.env` (`GEMINI_API_KEY`, `USER_API_KEY`, `DEFAULT_GOOGLE_MODEL`) into environment variables at startup. |
+| `arize-phoenix` | Observability/tracing UI (`app.py` calls `phoenix.launch_app()`) for inspecting every agent call, prompt, and moderation decision at `localhost:6006`. |
+| `openinference-instrumentation-pydantic-ai` | Automatically converts `pydantic-ai` agent calls into OpenTelemetry spans (`tracing.py`) so every LLM call shows up in Phoenix without manual instrumentation. |
 
-## Create virtual environment and install dependencies
+### Dev-only dependencies
 
-In the terminal, run:
-```bash
-uv sync --dev
-```
+| Library | Why it's used |
+| :---- | :---- |
+| `pytest` / `pytest-asyncio` | Test runner. `pytest-asyncio` is required because the agents are `async def` (`await agent.run(...)`); `asyncio_mode = "auto"` lets async tests run without extra decorators. |
+| `pydantic-evals` | Powers the `evals/` folder — structured evaluation of agent outputs, separate from pass/fail unit tests. |
+| `tenacity` | Retry logic for transient failures/rate limits. |
+| `black` / `isort` / `flake8` | Formatting and linting, enforcing consistent code style. |
+| `uv` | Dependency/environment manager used to run `uv sync` and `uv run`. | 
 
-## Install the app in edit mode
-We install our app in edit mode so edits we do in the files are reflected immediately in the installed app:
-```bash
-uv pip install -e .
-```
 
-## Set the virtual environment as interpreter for the project
+### `pydantic-evals` vs `arize-phoenix`: why both?
 
-In VS Code, hit Shift+Crtl+P (or Shift+Command+P on Mac) then select `Python: Select Interpreter`. Go to `Enter Interpreter Path`
-and then enter `.venv/bin/python`.
+At first glance both seem to be about "evaluating the agent," but they serve different, non-overlapping purposes. `arize-phoenix` is never even imported inside the `evals/` folder — it's used exclusively for live observability of the running app (see `tracing.py`, `app.py`).
 
-This will help you with syntax highlighting and other things.
+| | `pydantic-evals` | `arize-phoenix` |
+| :---- | :---- | :---- |
+| **Role** | Offline test/scoring framework | Live tracing/observability UI |
+| **Where used** | `evals/` folder only | `tracing.py`, `app.py` (the running app) |
+| **What it needs** | A dataset of `Case`s with known *expected* outputs (e.g. `expected_pii=True`) | Nothing pre-defined — it just captures whatever spans happen at runtime |
+| **How it judges correctness** | Two ways: (1) rule-based `Evaluator`s like `TextModerationCheck` that diff the agent's booleans against ground truth, and (2) `LLMJudge` — a separate LLM grading the rationale against a rubric | Doesn't judge correctness at all — no pass/fail, no rubric |
+| **Output** | A pass/fail report (`report.print(...)`) run on demand via `python evals/text/test_cases.py` | A trace viewer at `localhost:6006` where you inspect prompts/responses/latency for each conversation |
+| **When it runs** | On demand, as a batch job against curated test data | Continuously, every time someone chats with the app |
 
-## Configure credentials
+**Summary:** `pydantic-evals` answers *"is the model's output correct?"* against known-good test cases with automated grading. `arize-phoenix` answers *"what actually happened during this specific conversation?"* for debugging — it has no concept of "correct," it just records. Phoenix lets you notice a bad moderation call in a real trainee session; `pydantic-evals` is what turns that bad case into a permanent regression test with an expected answer, so it's caught automatically going forward.
 
-Open a terminal at the root of the repo, and copy the `env.example` file to `.env`:
-```bash
-cp env.example .env
-```
-then open .env and fill your API credential in GEMINI_API_KEY, as well as make up a USER_API_KEY (anything works). You can use
-for example `my-api-key`.
 
-**NOTE**: this is obviously not secure, but it is here to remind you that a real production app will need to have some authentication
-measure!
+### `pydantic-ai` vs `FastAPI`: why need both?
 
-# Execution
+These two libraries work at different layers, and it helps to think of it like a restaurant:
 
-Follow the following steps in order:
+- **`pydantic-ai` is the chef.** It's the code that actually does the work — it takes an input, sends it to Gemini (the AI model), and gets back a structured answer. This happens entirely *inside the kitchen* (in-process, plain Python function calls like `moderate_text()` in `agents/text_agent.py`).
+- **FastAPI is the waiter / order counter.** It's how something *outside* the kitchen — a different program, a browser, another service — can ask the chef to do something, without having direct access to that kitchen. A client sends an HTTP request to a FastAPI endpoint (e.g. `/api/v1/moderate_text`), FastAPI hands it to the chef (`pydantic-ai`, which calls Gemini), and returns the result.
 
-## 1. Moderation result
-Here we setup the Pydantic models for our moderation agents. These are the output schemas for the text, audio, image and video moderation agents we'll work on later. 
+**Why this project needs both:**
 
-1. Edit the `types/moderation_result.py` file and replace the `# TODO` sections with your code
-2. Run the test to get feedback on your work. From the root of the starter run: `uv run tests/test_moderation_result.py -vv`. 
-   If you get an error, read it carefully as it will give you information on what to fix.
-   **DO NOT** continue unless the test passes.
+In `app.py`, the Gradio frontend and the FastAPI backend are started as **two separate processes**:
 
-## 2. Text agent
-Here we will complete the setup of the moderation agent for text. 
-
-1. Edit the text agent (`agents/text_agent.py`) and replace the `# TODO` sections
-2. Run the test to get feedback on your work. From the root of the starter run: `uv run tests/test_text_agent.py -vv`. If you get an 
-    error, read it carefully as it will give you information on what to fix.
-    **DO NOT** continue unless the test passes.
-
-## 3. Image agent
-Here we will complete the setup of the moderation agent for images, similarly to what we just did for text. Since this is a multimodal agent, we will use the multimodal capabilities of Pydantic AI and Gemini.
-
-1. Edit the image agent (`agents/image_agent.py`) and replace the `# TODO` sections
-2. Run the test to get feedback on your work. From the root of the starter run: `uv run tests/test_image_agent.py -vv`. If you get an 
-    error, read it carefully as it will give you information on what to fix.
-    **DO NOT** continue unless the test passes.
-
-## 4. Video and Audio agents
-The audio and video agents are already completed. You will just test them to make sure they work.
-
-The Video and Audio agents are already complete. You can test them with `uv run tests/test_video_agent.py` and `uv run tests/test_audio_agent.py`.
-
-## 5. Gradio App
-Here we put everything together into a Gradio app, which constitutes the front-end of our solution.
-
-1. Edit the gradio app (`gradio_app.py`) and replace all `# TODO` sections. There are quite a few, going from the top to the bottom. Before moving on, make sure you did not left any by searching `TODO` in the file (Crtl+F or Command+F).
-2. Run the test to get feedback on your work. From the root of the starter run: `uv run tests/test_gradio_app.py -vv`. If you get an 
-    error, read it carefully as it will give you information on what to fix.
-    **DO NOT** continue unless the test passes.
-
-## 6. Run all tests
-
-It is now time to verify your work. Run all tests at once with:
-```bash
-uv run pytest tests/ -vv
-```
-All tests should pass. If they don't, fix them before submitting your project.
-
-## 7. Evals
-Now that our system is complete, we need to run evaluations to understand and measure how it behaves. 
-
-1. Edit the `evals/text/test_cases.py` and replace all `# TODO` sections. Same for `evals/image/test_cases.py`.
-2. Once you are done, run `uv run evals/text/test_cases.py` to see the results of the evals on text. 
-   NOTE: your score will NOT always be 100%! that is not a bug. The text agent is not perfect!
-3. Run the evals for the other media (`uv run evals/image/test_cases.py`, `uv run evals/audio/test_cases.py` and `uv run evals/video/test_cases.py`)
-
-# Play with the app
-
-## Conversation
-Now that you are done, the app should work. You can run it by executing in the terminal:
-
-```bash
-uv run multimodal-moderation
-```
-
-and then going with your browser to `http://localhost:7860/` to interact with the app. You are free to play with it, however, if you
-need inspiration, this is how a conversation could go:
-
-```
-YOU> Welcome to ACME Customer Service. How can I help?
-CUSTOMER-LLM> ... [will complain about the product not working]
-YOU> I am sorry to hear that. Is this the product you are talking about? [attach evals/test_data/professional_image.jpg]
-CUSTOMER-LLM> ... [will say something about wanting a refund]
-YOU> I am sorry but I absolutely cannot offer a refund
-------> message will be flagged as rude
-YOU> I am going to help you solving your issue. I am authorized to offer you a replacement. Would you be willing to accept it?
-CUSTOMER-LLM> ... [probably won't accept]
-[you can now close the conversation by clicking on the End Conversation button]
-```
-
-## See your traces
-After a conversation like the one suggested above, you can go to the Phoenix UI at `http://localhost:6006/projects`, click on the
-default project, and see your traces and spans. Explore the different metadata and different reports.
-
-## See your backend APIs
-
-Go to `http://0.0.0.0:8000/docs` to see a nice documentation of your moderation APIs. If you wanna test them out from here, click on Authorize on the upper right and insert your USER_API_KEY (the one you have set in your .env file). Then click on an endpoint (say, `/api/v1/moderate-text`) and click on Try it out (in the upper right). You will see a JSON like:
-```json
-{
-  "text": "string"
-}
-```
-Just change `string` to a message and click Execute, your message will be moderated. Scroll down a bit to see the results.
+```python
+api_process = subprocess.Popen(["multimodal-moderation-api"])   # FastAPI backend
+chat_process = subprocess.Popen(["multimodal-moderation-chat"]) # Gradio frontend
